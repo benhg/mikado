@@ -13,13 +13,13 @@ import sqlalchemy.exc
 from sqlalchemy.orm import relationship, backref, column_property
 from sqlalchemy.orm.session import Session  # sessionmaker
 from sqlalchemy import select
+import multiprocessing
+
 from ..utilities.dbutils import DBBASE, Inspector, connect
 from ..parsers import bed12  # , GFF
 from .blast_serializer import Query
 from ..utilities.log_utils import create_null_logger, check_logger
 from ..parsers import to_gff
-# from ..loci import Transcript
-# from Bio import SeqIO
 
 
 # This is a serialization class, it must have a ton of attributes ...
@@ -268,45 +268,45 @@ class OrfSerializer:
             cache[record.query_name] = record.query_id
 
         done = 0
-        cache = self.load_fasta(cache)
+        self.cache = self.load_fasta(self.cache)
 
         self.logger.debug("Loading IDs into the cache")
         for record in self.session.query(Query):
-            cache[record.query_name] = record.query_id
+            self.cache[record.query_name] = record.query_id
         self.logger.debug("Finished loading IDs into the cache")
 
-        for row in self.bed12_parser:
-            if row.header is True:
-                continue
-            if row.invalid is True:
-                self.logger.warn("Invalid entry, reason: %s\n%s",
-                                 row.invalid_reason,
-                                 row)
-                continue
-            if row.id in cache:
-                current_query = cache[row.id]
-            else:
-                current_query = Query(row.id, row.end)
-                self.session.add(current_query)
-                self.session.commit()
-                cache[current_query.query_name] = current_query.query_id
-                current_query = current_query.query_id
-
-            current_junction = Orf(row, current_query)
-            objects.append(current_junction)
-            if len(objects) >= self.maxobjects:
-                done += len(objects)
-                self.session.begin(subtransactions=True)
-                self.session.bulk_save_objects(objects)
-                self.session.commit()
-                self.logger.debug("Loaded %d ORFs into the database", done)
-                objects = []
+        pool = multiprocessing.Pool(2 * multiprocessing.cores)
+        objects = pool.map(self.bed12_parser, parallel_gen_object)
 
         done += len(objects)
         self.session.begin(subtransactions=True)
         self.session.bulk_save_objects(objects)
         self.logger.info("Finished loading %d ORFs into the database", done)
         self.session.commit()
+
+
+    def parallel_gen_object(row):
+        """
+        Generate objects to serialize in parallel
+        """
+        if row.header is True:
+            continue
+        if row.invalid is True:
+            self.logger.warn("Invalid entry, reason: %s\n%s",
+                             row.invalid_reason,
+                             row)
+            continue
+        if row.id in self.cache:
+            current_query = self.cache[row.id]
+        else:
+            current_query = Query(row.id, row.end)
+            self.session.add(current_query)
+            self.session.commit()
+            self.cache[current_query.query_name] = current_query.query_id
+            current_query = current_query.query_id
+
+        current_junction = Orf(row, current_query)
+        return current_junction
 
     def __call__(self):
         """
